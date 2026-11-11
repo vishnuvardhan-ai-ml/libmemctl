@@ -195,6 +195,15 @@ static size_t get_page_size(void)
 static size_t get_slab_mapping_bytes(void)
 {
     const size_t page_size = get_page_size();
+
+    if (page_size == 0U) {
+        errno = ENOMEM;
+        return 0U;
+    }
+    if (SLAB_BASE_BYTES > SIZE_MAX - (page_size - 1U)) {
+        errno = ENOMEM;
+        return 0U;
+    }
     if (page_size > SLAB_BASE_BYTES) {
         return page_size;
     }
@@ -204,6 +213,15 @@ static size_t get_slab_mapping_bytes(void)
 static size_t get_region_mapping_bytes(void)
 {
     const size_t page_size = get_page_size();
+
+    if (page_size == 0U) {
+        errno = ENOMEM;
+        return 0U;
+    }
+    if (REGION_BASE_BYTES > SIZE_MAX - (page_size - 1U)) {
+        errno = ENOMEM;
+        return 0U;
+    }
     if (page_size > REGION_BASE_BYTES) {
         return page_size;
     }
