@@ -4,3 +4,7 @@
 *.so
 *.core
 core
+
+/backup/
+/connection_test.txt
+/results/
