@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdalign.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -10,9 +11,9 @@
 #include <unistd.h>
 
 /*
- * libmemctl - Stage 4 Implementation (Corrected):
- * High-performance three-tier memory allocator with optimized in-place realloc
- * and concurrency/integrity hardening:
+ * libmemctl - Stage 4 Implementation:
+ * High-performance three-tier memory allocator with optimized in-place realloc,
+ * Knuth boundary tags, fine-grained locking, and C11 atomic metadata synchronization.
  *
  * 1. Small Tier (<= 1024 B): Size-class slabs with LIFO freelists.
  *    - In-place realloc when request fits within the existing slot capacity.
@@ -22,6 +23,13 @@
  *    - In-place realloc when capacity suffices or adjacent right free chunk
  *      can be consumed without invalidating boundary tags.
  * 3. Large Tier (> 65536 B): Dedicated anonymous page-aligned mmap/munmap.
+ *
+ * Concurrency Model:
+ * - alloc_header_t: magic, kind, and flags are C11 atomic fields.
+ * - Dispatch in my_free() and my_realloc() uses atomic acquire load of kind.
+ * - Slab operations synchronize via per-class s_slab_classes[class_idx].lock.
+ * - Medium region and free-bin operations synchronize via s_medium_mutex.
+ * - In-place realloc safely captures requested_size under the respective lock.
  */
 
 #define ALLOC_MAGIC_SMALL   0x534C4142U /* 'SLAB' */
@@ -52,12 +60,12 @@ typedef enum alloc_kind {
 } alloc_kind_t;
 
 typedef struct alloc_header {
-    uint32_t magic;          /* Validation tag: ALLOC_MAGIC_* */
-    uint16_t kind;           /* Allocation tier: ALLOC_KIND_* */
-    uint16_t flags;          /* Small: class_idx; Medium: CHUNK_FLAG_* */
-    size_t requested_size;   /* User payload size in bytes */
-    size_t total_size;       /* Gross slot, chunk, or mapping size in bytes */
-    void *container;         /* Owning slab_t* (small), region_t* (medium), or NULL */
+    _Atomic uint32_t magic;          /* Validation tag: ALLOC_MAGIC_* */
+    _Atomic uint16_t kind;           /* Allocation tier: ALLOC_KIND_* */
+    _Atomic uint16_t flags;          /* Small: class_idx; Medium: CHUNK_FLAG_* */
+    size_t requested_size;           /* User payload size in bytes */
+    size_t total_size;               /* Gross slot, chunk, or mapping size in bytes */
+    void *container;                 /* Owning slab_t* (small), region_t* (medium), or NULL */
 } alloc_header_t;
 
 _Static_assert(sizeof(alloc_header_t) == 32U,
@@ -77,6 +85,7 @@ typedef struct slab {
     uint32_t magic;              /* SLAB_MAGIC */
     uint16_t class_idx;          /* Index 0..11 */
     uint16_t is_spare;           /* 1 if cached spare, 0 otherwise */
+    size_t total_mapping_bytes;  /* Mapping length in bytes */
     size_t slot_size;            /* Gross slot size */
     size_t total_slots;          /* Max capacity of slots */
     size_t free_slots;           /* Available slots count */
@@ -156,7 +165,7 @@ static void slab_list_remove(slab_t **head, slab_t *slab);
 static slab_t *create_slab(size_t class_idx);
 static void *slab_malloc(size_t size);
 static void slab_free(alloc_header_t *header);
-static void *small_realloc_in_place(alloc_header_t *header, size_t new_size);
+static void *small_realloc_in_place(alloc_header_t *header, size_t new_size, size_t *old_size_out);
 
 static size_t get_medium_bin_index(size_t gross_size);
 static medium_free_node_t *chunk_to_free_node(alloc_header_t *chunk);
@@ -168,7 +177,7 @@ static void region_list_remove(region_t **head, region_t *region);
 static region_t *create_region(void);
 static void *medium_malloc(size_t size);
 static void medium_free(alloc_header_t *header);
-static void *medium_realloc_in_place(alloc_header_t *chunk, size_t new_size);
+static void *medium_realloc_in_place(alloc_header_t *chunk, size_t new_size, size_t *old_size_out);
 
 static void *direct_malloc(size_t size);
 static void direct_free(alloc_header_t *header);
@@ -233,8 +242,12 @@ static int calculate_mapping_size(size_t payload_bytes, size_t *mapping_bytes)
     const size_t page_size = get_page_size();
     size_t total_bytes;
 
-    if (mapping_bytes == NULL || page_size == 0U) {
+    if (mapping_bytes == NULL) {
         errno = EINVAL;
+        return -1;
+    }
+    if (page_size == 0U) {
+        errno = ENOMEM;
         return -1;
     }
 
@@ -307,6 +320,10 @@ static slab_t *create_slab(size_t class_idx)
     char *slot_start;
     char *slot_limit;
 
+    if (mapping_bytes == 0U) {
+        return NULL;
+    }
+
     mapping = mmap(NULL,
                    mapping_bytes,
                    PROT_READ | PROT_WRITE,
@@ -347,6 +364,7 @@ static slab_t *create_slab(size_t class_idx)
     slab->magic = SLAB_MAGIC;
     slab->class_idx = (uint16_t)class_idx;
     slab->is_spare = 0U;
+    slab->total_mapping_bytes = mapping_bytes;
     slab->slot_size = slot_size;
     slab->total_slots = total_slots;
     slab->free_slots = total_slots;
@@ -393,7 +411,18 @@ static void *slab_malloc(size_t size)
         slab_slot_node_t *node = slab->freelist;
         slab->freelist = node->next;
         slab->free_slots--;
-        slot = (void *)node;
+
+        /* Recover allocation header from the payload node */
+        header = ((alloc_header_t *)node) - 1;
+
+        /* Verify recovered slot integrity and class metadata */
+        if (atomic_load_explicit(&header->magic, memory_order_acquire) != ALLOC_MAGIC_FREE ||
+            atomic_load_explicit(&header->flags, memory_order_acquire) != (uint16_t)class_idx) {
+            (void)pthread_mutex_unlock(&sclass->lock);
+            return NULL;
+        }
+
+        slot = (void *)header;
     } else if (slab->bump_ptr + slab->slot_size <= slab->slot_limit) {
         slot = (void *)slab->bump_ptr;
         slab->bump_ptr += slab->slot_size;
@@ -414,35 +443,41 @@ static void *slab_malloc(size_t size)
 
     /* Initialize allocation header */
     header = (alloc_header_t *)slot;
-    header->magic = ALLOC_MAGIC_SMALL;
-    header->kind = (uint16_t)ALLOC_KIND_SMALL;
-    header->flags = (uint16_t)class_idx;
     header->requested_size = size;
     header->total_size = slab->slot_size;
     header->container = (void *)slab;
+    atomic_store_explicit(&header->flags, (uint16_t)class_idx, memory_order_release);
+    atomic_store_explicit(&header->kind, (uint16_t)ALLOC_KIND_SMALL, memory_order_release);
+    atomic_store_explicit(&header->magic, ALLOC_MAGIC_SMALL, memory_order_release);
 
     return (void *)(header + 1);
 }
 
 static void slab_free(alloc_header_t *header)
 {
-    const uint16_t class_idx = header->flags;
+    uint16_t class_idx;
     slab_t *slab;
     slab_class_t *sclass;
     slab_slot_node_t *node;
-    int unmap_slab = 0;
+    slab_t *unmap_slab = NULL;
 
-    if (class_idx >= NUM_SLAB_CLASSES) {
+    if (header == NULL) {
         return;
     }
 
-    slab = (slab_t *)header->container;
-    if (slab == NULL || slab->magic != SLAB_MAGIC) {
+    class_idx = atomic_load_explicit(&header->flags, memory_order_acquire);
+    if (class_idx >= NUM_SLAB_CLASSES) {
         return;
     }
 
     sclass = &s_slab_classes[class_idx];
     if (pthread_mutex_lock(&sclass->lock) != 0) {
+        return;
+    }
+
+    slab = (slab_t *)header->container;
+    if (slab == NULL || slab->magic != SLAB_MAGIC || slab->class_idx != class_idx) {
+        (void)pthread_mutex_unlock(&sclass->lock);
         return;
     }
 
@@ -457,11 +492,17 @@ static void slab_free(alloc_header_t *header)
         return;
     }
 
-    /* Poison magic to guard against double-free */
-    header->magic = ALLOC_MAGIC_FREE;
+    /* Verify magic and guard against double-free */
+    if (atomic_load_explicit(&header->magic, memory_order_acquire) != ALLOC_MAGIC_SMALL) {
+        (void)pthread_mutex_unlock(&sclass->lock);
+        return;
+    }
 
-    /* Push slot to LIFO freelist */
-    node = (slab_slot_node_t *)header;
+    /* Poison magic to guard against double-free */
+    atomic_store_explicit(&header->magic, ALLOC_MAGIC_FREE, memory_order_release);
+
+    /* Push slot to LIFO freelist using payload area (header + 1) */
+    node = (slab_slot_node_t *)(header + 1);
     node->next = slab->freelist;
     slab->freelist = node;
     slab->free_slots++;
@@ -480,14 +521,14 @@ static void slab_free(alloc_header_t *header)
             slab->is_spare = 1U;
         } else {
             /* Spare already cached; unmap this slab */
-            unmap_slab = 1;
+            unmap_slab = slab;
         }
     }
 
     (void)pthread_mutex_unlock(&sclass->lock);
 
-    if (unmap_slab != 0) {
-        (void)munmap((void *)slab, get_slab_mapping_bytes());
+    if (unmap_slab != NULL) {
+        (void)munmap((void *)unmap_slab, unmap_slab->total_mapping_bytes);
     }
 }
 
@@ -495,41 +536,64 @@ static void slab_free(alloc_header_t *header)
  * In-place realloc optimization for small slab allocations:
  * If the new requested size fits within the payload capacity of the current slot,
  * update requested_size safely and retain the same pointer.
+ * The old requested size is captured safely under the class mutex into *old_size_out.
  */
-static void *small_realloc_in_place(alloc_header_t *header, size_t new_size)
+static void *small_realloc_in_place(alloc_header_t *header, size_t new_size, size_t *old_size_out)
 {
-    const uint16_t class_idx = header->flags;
+    uint16_t class_idx;
     slab_t *slab;
     slab_class_t *sclass;
     size_t slot_capacity;
 
+    if (header == NULL) {
+        return NULL;
+    }
+
+    class_idx = atomic_load_explicit(&header->flags, memory_order_acquire);
     if (class_idx >= NUM_SLAB_CLASSES) {
         return NULL;
     }
 
-    slab = (slab_t *)header->container;
-    if (slab == NULL || slab->magic != SLAB_MAGIC) {
+    sclass = &s_slab_classes[class_idx];
+    if (pthread_mutex_lock(&sclass->lock) != 0) {
         return NULL;
     }
 
-    sclass = &s_slab_classes[class_idx];
+    slab = (slab_t *)header->container;
+    if (slab == NULL || slab->magic != SLAB_MAGIC || slab->class_idx != class_idx) {
+        (void)pthread_mutex_unlock(&sclass->lock);
+        return NULL;
+    }
+
+    /* Verify slot is within slab bounds and aligned to slot boundary */
+    if ((char *)header < slab->slot_start ||
+        (char *)header + slab->slot_size > slab->slot_limit ||
+        ((size_t)((char *)header - slab->slot_start)) % slab->slot_size != 0U) {
+        (void)pthread_mutex_unlock(&sclass->lock);
+        return NULL;
+    }
+
+    /* Verify magic */
+    if (atomic_load_explicit(&header->magic, memory_order_acquire) != ALLOC_MAGIC_SMALL) {
+        (void)pthread_mutex_unlock(&sclass->lock);
+        return NULL;
+    }
+
+    /* Safely capture the old requested size under mutex */
+    if (old_size_out != NULL) {
+        *old_size_out = header->requested_size;
+    }
+
     slot_capacity = sclass->payload_size;
 
     /* Check if the new size fits within the current slot capacity */
     if (new_size <= slot_capacity) {
-        if (pthread_mutex_lock(&sclass->lock) != 0) {
-            return NULL;
-        }
-        /* Verify slot integrity and bounds */
-        if ((char *)header >= slab->slot_start &&
-            (char *)header + slab->slot_size <= slab->slot_limit) {
-            header->requested_size = new_size;
-            (void)pthread_mutex_unlock(&sclass->lock);
-            return (void *)(header + 1);
-        }
+        header->requested_size = new_size;
         (void)pthread_mutex_unlock(&sclass->lock);
+        return (void *)(header + 1);
     }
 
+    (void)pthread_mutex_unlock(&sclass->lock);
     return NULL;
 }
 
@@ -623,6 +687,10 @@ static region_t *create_region(void)
     char *usable_end;
     alloc_header_t *initial_chunk;
 
+    if (mapping_bytes == 0U) {
+        return NULL;
+    }
+
     mapping = mmap(NULL,
                    mapping_bytes,
                    PROT_READ | PROT_WRITE,
@@ -661,12 +729,12 @@ static region_t *create_region(void)
 
     /* Initialize single free chunk spanning entire usable space */
     initial_chunk = (alloc_header_t *)usable_start;
-    initial_chunk->magic = ALLOC_MAGIC_FREE;
-    initial_chunk->kind = (uint16_t)ALLOC_KIND_MEDIUM;
-    initial_chunk->flags = 0U;
     initial_chunk->requested_size = 0U;
     initial_chunk->total_size = usable_bytes;
     initial_chunk->container = (void *)region;
+    atomic_store_explicit(&initial_chunk->flags, 0U, memory_order_release);
+    atomic_store_explicit(&initial_chunk->kind, (uint16_t)ALLOC_KIND_MEDIUM, memory_order_release);
+    atomic_store_explicit(&initial_chunk->magic, ALLOC_MAGIC_FREE, memory_order_release);
 
     /* Write Knuth boundary footer at end of chunk */
     *(size_t *)(usable_start + usable_bytes - sizeof(size_t)) = usable_bytes;
@@ -730,12 +798,12 @@ static void *medium_malloc(size_t size)
     excess = chunk->total_size - gross_size;
     if (excess >= MEDIUM_MIN_CHUNK) {
         alloc_header_t *rem_chunk = (alloc_header_t *)((char *)chunk + gross_size);
-        rem_chunk->magic = ALLOC_MAGIC_FREE;
-        rem_chunk->kind = (uint16_t)ALLOC_KIND_MEDIUM;
-        rem_chunk->flags = 0U; /* Previous chunk will be IN_USE */
         rem_chunk->requested_size = 0U;
         rem_chunk->total_size = excess;
         rem_chunk->container = (void *)region;
+        atomic_store_explicit(&rem_chunk->flags, 0U, memory_order_release); /* Previous chunk will be IN_USE */
+        atomic_store_explicit(&rem_chunk->kind, (uint16_t)ALLOC_KIND_MEDIUM, memory_order_release);
+        atomic_store_explicit(&rem_chunk->magic, ALLOC_MAGIC_FREE, memory_order_release);
 
         /* Write footer for remainder chunk */
         *(size_t *)((char *)rem_chunk + excess - sizeof(size_t)) = excess;
@@ -743,7 +811,7 @@ static void *medium_malloc(size_t size)
         /* Update chunk after remainder to indicate remainder is FREE */
         right_neighbor = (alloc_header_t *)((char *)rem_chunk + excess);
         if ((char *)right_neighbor < region->usable_end) {
-            right_neighbor->flags |= CHUNK_FLAG_PREV_FREE;
+            atomic_fetch_or_explicit(&right_neighbor->flags, CHUNK_FLAG_PREV_FREE, memory_order_release);
         }
 
         /* Insert remainder chunk into appropriate segregated bin */
@@ -754,16 +822,16 @@ static void *medium_malloc(size_t size)
         /* No split: update right-hand neighbor to indicate chunk is IN_USE */
         right_neighbor = (alloc_header_t *)((char *)chunk + chunk->total_size);
         if ((char *)right_neighbor < region->usable_end) {
-            right_neighbor->flags &= ~CHUNK_FLAG_PREV_FREE;
+            atomic_fetch_and_explicit(&right_neighbor->flags, (uint16_t)~CHUNK_FLAG_PREV_FREE, memory_order_release);
         }
     }
 
     /* 4. Finalize allocated chunk */
-    chunk->magic = ALLOC_MAGIC_MEDIUM;
-    chunk->kind = (uint16_t)ALLOC_KIND_MEDIUM;
-    chunk->flags |= CHUNK_FLAG_IN_USE;
     chunk->requested_size = size;
     chunk->container = (void *)region;
+    atomic_store_explicit(&chunk->kind, (uint16_t)ALLOC_KIND_MEDIUM, memory_order_release);
+    atomic_fetch_or_explicit(&chunk->flags, CHUNK_FLAG_IN_USE, memory_order_release);
+    atomic_store_explicit(&chunk->magic, ALLOC_MAGIC_MEDIUM, memory_order_release);
 
     region->active_allocations++;
 
@@ -779,13 +847,11 @@ static void medium_free(alloc_header_t *header)
     alloc_header_t *right_neighbor;
     region_t *unmap_region = NULL;
     size_t total_usable;
+    uint32_t magic;
+    uint16_t kind;
+    uint16_t flags;
 
-    if (chunk == NULL || chunk->magic != ALLOC_MAGIC_MEDIUM || chunk->kind != (uint16_t)ALLOC_KIND_MEDIUM) {
-        return;
-    }
-
-    region = (region_t *)chunk->container;
-    if (region == NULL || region->magic != REGION_MAGIC) {
+    if (chunk == NULL) {
         return;
     }
 
@@ -793,8 +859,22 @@ static void medium_free(alloc_header_t *header)
         return;
     }
 
+    magic = atomic_load_explicit(&chunk->magic, memory_order_acquire);
+    kind = atomic_load_explicit(&chunk->kind, memory_order_acquire);
+    if (magic != ALLOC_MAGIC_MEDIUM || kind != (uint16_t)ALLOC_KIND_MEDIUM) {
+        (void)pthread_mutex_unlock(&s_medium_mutex);
+        return;
+    }
+
+    region = (region_t *)chunk->container;
+    if (region == NULL || region->magic != REGION_MAGIC) {
+        (void)pthread_mutex_unlock(&s_medium_mutex);
+        return;
+    }
+
+    flags = atomic_load_explicit(&chunk->flags, memory_order_acquire);
     /* Check double-free and bounds */
-    if ((chunk->flags & CHUNK_FLAG_IN_USE) == 0U) {
+    if ((flags & CHUNK_FLAG_IN_USE) == 0U) {
         (void)pthread_mutex_unlock(&s_medium_mutex);
         return;
     }
@@ -807,18 +887,21 @@ static void medium_free(alloc_header_t *header)
     region->active_allocations--;
 
     /* Mark chunk free */
-    chunk->magic = ALLOC_MAGIC_FREE;
-    chunk->flags &= ~CHUNK_FLAG_IN_USE;
+    atomic_store_explicit(&chunk->magic, ALLOC_MAGIC_FREE, memory_order_release);
+    atomic_fetch_and_explicit(&chunk->flags, (uint16_t)~CHUNK_FLAG_IN_USE, memory_order_release);
 
     /* 1. Bidirectional Coalescing: Left */
-    if ((chunk->flags & CHUNK_FLAG_PREV_FREE) != 0U && (char *)chunk > region->usable_start) {
+    flags = atomic_load_explicit(&chunk->flags, memory_order_acquire);
+    if ((flags & CHUNK_FLAG_PREV_FREE) != 0U && (char *)chunk > region->usable_start) {
         const size_t prev_size = *(size_t *)((char *)chunk - sizeof(size_t));
         if (prev_size >= MEDIUM_MIN_CHUNK &&
             (prev_size % _Alignof(max_align_t)) == 0U &&
             (char *)chunk - prev_size >= region->usable_start) {
             alloc_header_t *left_chunk = (alloc_header_t *)((char *)chunk - prev_size);
-            if (left_chunk->magic == ALLOC_MAGIC_FREE &&
-                (left_chunk->flags & CHUNK_FLAG_IN_USE) == 0U &&
+            uint32_t left_magic = atomic_load_explicit(&left_chunk->magic, memory_order_acquire);
+            uint16_t left_flags = atomic_load_explicit(&left_chunk->flags, memory_order_acquire);
+            if (left_magic == ALLOC_MAGIC_FREE &&
+                (left_flags & CHUNK_FLAG_IN_USE) == 0U &&
                 left_chunk->total_size == prev_size) {
                 medium_bin_remove(left_chunk);
                 left_chunk->total_size += chunk->total_size;
@@ -830,8 +913,10 @@ static void medium_free(alloc_header_t *header)
     /* 2. Bidirectional Coalescing: Right */
     right_neighbor = (alloc_header_t *)((char *)chunk + chunk->total_size);
     if ((char *)right_neighbor < region->usable_end) {
-        if (right_neighbor->magic == ALLOC_MAGIC_FREE &&
-            (right_neighbor->flags & CHUNK_FLAG_IN_USE) == 0U) {
+        uint32_t right_magic = atomic_load_explicit(&right_neighbor->magic, memory_order_acquire);
+        uint16_t right_flags = atomic_load_explicit(&right_neighbor->flags, memory_order_acquire);
+        if (right_magic == ALLOC_MAGIC_FREE &&
+            (right_flags & CHUNK_FLAG_IN_USE) == 0U) {
             const size_t right_size = right_neighbor->total_size;
             if (right_size >= MEDIUM_MIN_CHUNK &&
                 (right_size % _Alignof(max_align_t)) == 0U &&
@@ -848,7 +933,7 @@ static void medium_free(alloc_header_t *header)
     /* 4. Update right neighbor's PREV_FREE flag */
     right_neighbor = (alloc_header_t *)((char *)chunk + chunk->total_size);
     if ((char *)right_neighbor < region->usable_end) {
-        right_neighbor->flags |= CHUNK_FLAG_PREV_FREE;
+        atomic_fetch_or_explicit(&right_neighbor->flags, CHUNK_FLAG_PREV_FREE, memory_order_release);
     }
 
     /* 5. Region Reclamation */
@@ -879,34 +964,52 @@ static void medium_free(alloc_header_t *header)
  *    without modifying chunk size or boundary tags.
  * 2. If new size exceeds capacity and stays within the medium tier, attempt to
  *    absorb the physically adjacent right free chunk without moving payload.
+ * The old requested size is captured safely under s_medium_mutex into *old_size_out.
  */
-static void *medium_realloc_in_place(alloc_header_t *chunk, size_t new_size)
+static void *medium_realloc_in_place(alloc_header_t *chunk, size_t new_size, size_t *old_size_out)
 {
     region_t *region;
     size_t capacity;
+    uint32_t magic;
+    uint16_t kind;
+    uint16_t flags;
 
-    if (chunk == NULL || chunk->magic != ALLOC_MAGIC_MEDIUM || chunk->kind != (uint16_t)ALLOC_KIND_MEDIUM) {
+    if (chunk == NULL) {
         return NULL;
     }
-
-    region = (region_t *)chunk->container;
-    if (region == NULL || region->magic != REGION_MAGIC) {
-        return NULL;
-    }
-
-    capacity = chunk->total_size - sizeof(alloc_header_t);
 
     if (pthread_mutex_lock(&s_medium_mutex) != 0) {
         return NULL;
     }
 
+    magic = atomic_load_explicit(&chunk->magic, memory_order_acquire);
+    kind = atomic_load_explicit(&chunk->kind, memory_order_acquire);
+    if (magic != ALLOC_MAGIC_MEDIUM || kind != (uint16_t)ALLOC_KIND_MEDIUM) {
+        (void)pthread_mutex_unlock(&s_medium_mutex);
+        return NULL;
+    }
+
+    region = (region_t *)chunk->container;
+    if (region == NULL || region->magic != REGION_MAGIC) {
+        (void)pthread_mutex_unlock(&s_medium_mutex);
+        return NULL;
+    }
+
+    flags = atomic_load_explicit(&chunk->flags, memory_order_acquire);
     /* Verify chunk integrity and active state */
-    if ((chunk->flags & CHUNK_FLAG_IN_USE) == 0U ||
+    if ((flags & CHUNK_FLAG_IN_USE) == 0U ||
         (char *)chunk < region->usable_start ||
         (char *)chunk + chunk->total_size > region->usable_end) {
         (void)pthread_mutex_unlock(&s_medium_mutex);
         return NULL;
     }
+
+    /* Safely capture the old requested size under medium mutex */
+    if (old_size_out != NULL) {
+        *old_size_out = chunk->requested_size;
+    }
+
+    capacity = chunk->total_size - sizeof(alloc_header_t);
 
     /* Case A: Already fits within current chunk capacity */
     if (new_size <= capacity) {
@@ -921,28 +1024,36 @@ static void *medium_realloc_in_place(alloc_header_t *chunk, size_t new_size)
         const size_t gross_size = (sizeof(alloc_header_t) + new_size + align_mask) & ~align_mask;
         alloc_header_t *right = (alloc_header_t *)((char *)chunk + chunk->total_size);
 
-        if ((char *)right < region->usable_end &&
-            right->magic == ALLOC_MAGIC_FREE &&
-            (right->flags & CHUNK_FLAG_IN_USE) == 0U) {
-            const size_t right_size = right->total_size;
-            if (right_size >= MEDIUM_MIN_CHUNK &&
-                (right_size % _Alignof(max_align_t)) == 0U &&
-                (char *)right + right_size <= region->usable_end) {
-                const size_t combined_size = chunk->total_size + right_size;
-                if (combined_size >= gross_size) {
-                    /* Merge right chunk into this chunk */
-                    medium_bin_remove(right);
-                    chunk->total_size = combined_size;
-                    chunk->requested_size = new_size;
+        if ((char *)right < region->usable_end) {
+            uint32_t right_magic = atomic_load_explicit(&right->magic, memory_order_acquire);
+            uint16_t right_flags = atomic_load_explicit(&right->flags, memory_order_acquire);
 
-                    /* Clear PREV_FREE on the chunk after the combined chunk */
-                    alloc_header_t *next_neighbor = (alloc_header_t *)((char *)chunk + combined_size);
-                    if ((char *)next_neighbor < region->usable_end) {
-                        next_neighbor->flags &= ~CHUNK_FLAG_PREV_FREE;
+            if (right_magic == ALLOC_MAGIC_FREE && (right_flags & CHUNK_FLAG_IN_USE) == 0U) {
+                const size_t right_size = right->total_size;
+                if (right_size >= MEDIUM_MIN_CHUNK &&
+                    (right_size % _Alignof(max_align_t)) == 0U &&
+                    (char *)right + right_size <= region->usable_end) {
+                    const size_t combined_size = chunk->total_size + right_size;
+                    if (combined_size >= gross_size) {
+                        alloc_header_t *next_neighbor;
+
+                        /* Merge right chunk into this chunk */
+                        medium_bin_remove(right);
+                        chunk->total_size = combined_size;
+                        chunk->requested_size = new_size;
+
+                        /* Update boundary footer at the end of the combined chunk */
+                        *(size_t *)((char *)chunk + combined_size - sizeof(size_t)) = combined_size;
+
+                        /* Clear PREV_FREE on the chunk after the combined chunk */
+                        next_neighbor = (alloc_header_t *)((char *)chunk + combined_size);
+                        if ((char *)next_neighbor < region->usable_end) {
+                            atomic_fetch_and_explicit(&next_neighbor->flags, (uint16_t)~CHUNK_FLAG_PREV_FREE, memory_order_release);
+                        }
+
+                        (void)pthread_mutex_unlock(&s_medium_mutex);
+                        return (void *)(chunk + 1);
                     }
-
-                    (void)pthread_mutex_unlock(&s_medium_mutex);
-                    return (void *)(chunk + 1);
                 }
             }
         }
@@ -976,12 +1087,12 @@ static void *direct_malloc(size_t size)
     }
 
     header = (alloc_header_t *)mapping;
-    header->magic = ALLOC_MAGIC_DIRECT;
-    header->kind = (uint16_t)ALLOC_KIND_DIRECT;
-    header->flags = 0U;
     header->requested_size = size;
     header->total_size = mapping_bytes;
     header->container = NULL;
+    atomic_store_explicit(&header->flags, 0U, memory_order_release);
+    atomic_store_explicit(&header->kind, (uint16_t)ALLOC_KIND_DIRECT, memory_order_release);
+    atomic_store_explicit(&header->magic, ALLOC_MAGIC_DIRECT, memory_order_release);
 
     return (void *)(header + 1);
 }
@@ -989,7 +1100,7 @@ static void *direct_malloc(size_t size)
 static void direct_free(alloc_header_t *header)
 {
     /* Poison magic to guard against double-free */
-    header->magic = ALLOC_MAGIC_FREE;
+    atomic_store_explicit(&header->magic, ALLOC_MAGIC_FREE, memory_order_release);
 
     (void)munmap((void *)header, header->total_size);
 }
@@ -1012,25 +1123,32 @@ void *my_malloc(size_t size)
 void my_free(void *ptr)
 {
     alloc_header_t *header;
+    uint16_t kind;
 
     if (ptr == NULL) {
         return;
     }
 
     header = ((alloc_header_t *)ptr) - 1;
-    if (header->magic == ALLOC_MAGIC_SMALL && header->kind == (uint16_t)ALLOC_KIND_SMALL) {
+    kind = atomic_load_explicit(&header->kind, memory_order_acquire);
+
+    if (kind == (uint16_t)ALLOC_KIND_SMALL) {
         slab_free(header);
-    } else if (header->magic == ALLOC_MAGIC_MEDIUM && header->kind == (uint16_t)ALLOC_KIND_MEDIUM) {
+    } else if (kind == (uint16_t)ALLOC_KIND_MEDIUM) {
         medium_free(header);
-    } else if (header->magic == ALLOC_MAGIC_DIRECT && header->kind == (uint16_t)ALLOC_KIND_DIRECT) {
-        direct_free(header);
+    } else if (kind == (uint16_t)ALLOC_KIND_DIRECT) {
+        uint32_t magic = atomic_load_explicit(&header->magic, memory_order_acquire);
+        if (magic == ALLOC_MAGIC_DIRECT) {
+            direct_free(header);
+        }
     }
 }
 
 void *my_realloc(void *ptr, size_t size)
 {
     alloc_header_t *old_header;
-    size_t old_size;
+    uint16_t kind;
+    size_t old_size = (size_t)-1;
     size_t copy_size;
     void *new_ptr;
 
@@ -1044,27 +1162,42 @@ void *my_realloc(void *ptr, size_t size)
     }
 
     old_header = ((alloc_header_t *)ptr) - 1;
+    kind = atomic_load_explicit(&old_header->kind, memory_order_acquire);
 
     /* 1. Try small in-place reuse */
-    if (old_header->magic == ALLOC_MAGIC_SMALL && old_header->kind == (uint16_t)ALLOC_KIND_SMALL) {
-        void *in_place = small_realloc_in_place(old_header, size);
+    if (kind == (uint16_t)ALLOC_KIND_SMALL) {
+        void *in_place = small_realloc_in_place(old_header, size, &old_size);
         if (in_place != NULL) {
             return in_place;
+        }
+        if (old_size == (size_t)-1) {
+            errno = EINVAL;
+            return NULL;
         }
     }
     /* 2. Try medium in-place reuse or right-neighbor growth */
-    else if (old_header->magic == ALLOC_MAGIC_MEDIUM && old_header->kind == (uint16_t)ALLOC_KIND_MEDIUM) {
-        void *in_place = medium_realloc_in_place(old_header, size);
+    else if (kind == (uint16_t)ALLOC_KIND_MEDIUM) {
+        void *in_place = medium_realloc_in_place(old_header, size, &old_size);
         if (in_place != NULL) {
             return in_place;
         }
+        if (old_size == (size_t)-1) {
+            errno = EINVAL;
+            return NULL;
+        }
     }
-    else if (old_header->magic != ALLOC_MAGIC_DIRECT || old_header->kind != (uint16_t)ALLOC_KIND_DIRECT) {
+    else if (kind == (uint16_t)ALLOC_KIND_DIRECT) {
+        uint32_t magic = atomic_load_explicit(&old_header->magic, memory_order_acquire);
+        if (magic != ALLOC_MAGIC_DIRECT) {
+            errno = EINVAL;
+            return NULL;
+        }
+        old_size = old_header->requested_size;
+    }
+    else {
         errno = EINVAL;
         return NULL;
     }
-
-    old_size = old_header->requested_size;
 
     /* 3. Moving reallocation fallback */
     new_ptr = my_malloc(size);
