@@ -15,7 +15,7 @@ LIB       = $(BUILD_DIR)/libmemctl.a
 ALLOC_OBJ = $(BUILD_DIR)/allocator.o
 TEST_BIN  = $(BUILD_DIR)/test_runner
 
-.PHONY: all test check check-symbols clean
+.PHONY: all test check check-symbols benchmark clean
 
 all: $(LIB) $(TEST_BIN)
 
@@ -46,5 +46,12 @@ check-symbols: $(ALLOC_OBJ)
 
 check: check-symbols test
 
+BENCH_BIN = $(BUILD_DIR)/allocator_bench
+
+$(BENCH_BIN): benchmarks/allocator_bench.c include/libmemctl.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(NO_ALLOC_BUILTINS) $< $(LIB) $(LDLIBS) -o $@
+
+benchmark: $(BENCH_BIN)
+	./$(BENCH_BIN)
 clean:
 	rm -rf $(BUILD_DIR)
