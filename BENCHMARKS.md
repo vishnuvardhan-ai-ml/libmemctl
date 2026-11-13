@@ -55,8 +55,8 @@ Results from the latest clean build and benchmark run:
 | Metric | 1 Thread | 8 Threads |
 |---|---:|---:|
 | Total operations | 20,000 | 160,000 |
-| Elapsed time | 0.005367 seconds | 0.039408 seconds |
-| Throughput | 3,726,466 ops/s | 4,060,069 ops/s |
+| Elapsed time | 0.005419 seconds | 0.035041 seconds |
+| Throughput | 3,690,739 ops/s | 4,566,074 ops/s |
 | Errors | 0 | 0 |
 | Result | PASS | PASS |
 
@@ -83,7 +83,7 @@ The allocator symbol check also passed.
 
 - Both benchmark workloads completed successfully.
 - No benchmark errors were reported.
-- The eight-thread workload achieved approximately 4.06 million operations per second in the latest run.
+- The eight-thread workload achieved approximately 4.57 million operations per second in the latest run.
 - Performance can vary between runs due to scheduling and virtual-machine overhead.
 - The VM has two assigned CPUs, so the results should not be interpreted as eight-core scaling.
 
